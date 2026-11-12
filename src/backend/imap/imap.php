@@ -53,6 +53,7 @@ class BackendIMAP extends BackendDiff implements ISearchProvider {
     private $excludedFolders;
     private static $mimeTypes = false;
     private $imapParams = array();
+    private $imap_force_reopen = array();  // folders whose last fetch failed: next open gets a fresh SELECT (t_248724ab)
 
     private $dontStat = array();            //keys in this array represent mailboxes which can't be stat'd (ie, /NoSELECT status)
     
@@ -1139,12 +1140,39 @@ class BackendIMAP extends BackendDiff implements ISearchProvider {
         $stat = $this->StatMessage($folderid, $id);
 
         if ($stat) {
-            $this->imap_reopen_folder($folderImapid);
+            if (!$this->imap_reopen_folder($folderImapid)) {
+                // A failed reopen usually means the server rejected the
+                // SELECT (e.g. rate limiting): wait out the cooldown and
+                // retry once before giving up on this fetch (t_248724ab).
+                $backoff = $this->imap_limit_backoff();
+                if ($backoff > 0) {
+                    ZLog::Write(LOGLEVEL_WARN, sprintf("BackendIMAP->GetMessage('%s','%s'): reopen rate limited (%s), retrying in %d seconds", $folderid, $id, imap_last_error(), $backoff));
+                    sleep($backoff);
+                    $this->imap_force_reopen[$folderImapid] = true;
+                    $this->imap_reopen_folder($folderImapid);
+                }
+            }
             $mail_headers = @imap_fetchheader($this->mbox, $id, FT_UID);
             $mail =  $mail_headers . @imap_body($this->mbox, $id, FT_PEEK | FT_UID);
 
             if (empty($mail)) {
-                throw new StatusException(sprintf("BackendIMAP->GetMessage(): Error, message not found, maybe was moved"), SYNC_ITEMOPERATIONSSTATUS_INVALIDATT);
+                // One-off empty fetch responses have been observed on an
+                // otherwise healthy folder. While the server rate limits,
+                // wait the requested cooldown and retry once from a fresh
+                // SELECT before surfacing the failure (t_248724ab).
+                $backoff = $this->imap_limit_backoff();
+                if ($backoff > 0) {
+                    ZLog::Write(LOGLEVEL_WARN, sprintf("BackendIMAP->GetMessage('%s','%s'): empty fetch while rate limited (%s), retrying in %d seconds", $folderid, $id, imap_last_error(), $backoff));
+                    sleep($backoff);
+                    $this->imap_force_reopen[$folderImapid] = true;
+                    $this->imap_reopen_folder($folderImapid);
+                    $mail_headers = @imap_fetchheader($this->mbox, $id, FT_UID);
+                    $mail =  $mail_headers . @imap_body($this->mbox, $id, FT_PEEK | FT_UID);
+                }
+                if (empty($mail)) {
+                    $this->imap_force_reopen[$folderImapid] = true;
+                    throw new StatusException(sprintf("BackendIMAP->GetMessage(): Error, message not found, maybe was moved"), SYNC_ITEMOPERATIONSSTATUS_INVALIDATT);
+                }
             }
 
             $mobj = new Mail_mimeDecode($mail);
@@ -1577,8 +1605,22 @@ class BackendIMAP extends BackendDiff implements ISearchProvider {
         $overview = @imap_fetch_overview($this->mbox, $id, FT_UID);
 
         if (!$overview) {
-            ZLog::Write(LOGLEVEL_WARN, sprintf("BackendIMAP->StatMessage('%s','%s'): Failed to retrieve overview: %s", $folderid, $id, imap_last_error()));
-            return false;
+            // The server may rate limit (or transiently drop the response):
+            // wait the requested cooldown and retry once from a fresh SELECT.
+            // A final failure still just skips this message - same as before (t_248724ab).
+            $backoff = $this->imap_limit_backoff();
+            if ($backoff > 0) {
+                ZLog::Write(LOGLEVEL_WARN, sprintf("BackendIMAP->StatMessage('%s','%s'): rate limited (%s), retrying overview in %d seconds", $folderid, $id, imap_last_error(), $backoff));
+                sleep($backoff);
+                $this->imap_force_reopen[$folderImapid] = true;
+                $this->imap_reopen_folder($folderImapid);
+                $overview = @imap_fetch_overview($this->mbox, $id, FT_UID);
+            }
+            if (!$overview) {
+                $this->imap_force_reopen[$folderImapid] = true;
+                ZLog::Write(LOGLEVEL_WARN, sprintf("BackendIMAP->StatMessage('%s','%s'): Failed to retrieve overview: %s", $folderid, $id, imap_last_error()));
+                return false;
+            }
         }
 
         // without uid it's not a valid message
@@ -2364,18 +2406,38 @@ class BackendIMAP extends BackendDiff implements ISearchProvider {
         // Reconnect
         $this->imap_reconnect();
 
+        // A previous failed fetch on this folder marks it for a fresh
+        // SELECT (t_248724ab)
+        $force = $force || !empty($this->imap_force_reopen[$folderid]);
+        unset($this->imap_force_reopen[$folderid]);
+
         // to see changes, the folder has to be reopened!
         if ($this->mboxFolder != $folderid || $force) {
             $s = @imap_reopen($this->mbox, $this->server . $folderid);
             // TODO throw status exception
             if (!$s) {
                 ZLog::Write(LOGLEVEL_WARN, sprintf("BackendIMAP->imap_reopen_folder('%s'): failed to change folder: %s", $folderid, implode(", ", imap_errors())));
+                $this->imap_force_reopen[$folderid] = true;
                 return false;
             }
             $this->mboxFolder = $folderid;
         }
 
         return true;
+    }
+
+    /**
+     * Returns the cooldown in seconds requested by a server-side rate
+     * limit response ("[LIMIT] Too many requests, retry in N seconds"),
+     * capped at 60s, or 0 if the last IMAP error is not a rate limit
+     * (t_248724ab).
+     */
+    protected function imap_limit_backoff() {
+        $error = imap_last_error();
+        if (is_string($error) && preg_match('/retry in (\d+) seconds?/i', $error, $m)) {
+            return min((int)$m[1], 60);
+        }
+        return 0;
     }
 
     /**
