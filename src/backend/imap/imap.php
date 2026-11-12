@@ -2441,18 +2441,29 @@ class BackendIMAP extends BackendDiff implements ISearchProvider {
     }
 
     /**
-     * Reconnect IMAP connection if needed
+     * Reconnect IMAP connection if needed.
+     *
+     * Pings the existing connection; if the ping fails (e.g. the server
+     * dropped the connection while it sat idle during a backoff sleep),
+     * the connection is fully re-opened. Pinging a dead resource without
+     * re-opening it would leave every subsequent command failing for the
+     * rest of the request (t_8ac076fc).
      *
      * @access private
      */
     private function imap_reconnect() {
         if ($this->mbox) {
-            imap_ping($this->mbox);
+            if (@imap_ping($this->mbox)) {
+                return;
+            }
+            ZLog::Write(LOGLEVEL_WARN, "BackendIMAP->imap_reconnect(): IMAP connection lost (ping failed: " . imap_last_error() . "), reopening");
+            $this->mbox = null;
         }
-        else {
-            $this->mbox = @imap_open($this->server, $this->username, $this->password, OP_HALFOPEN, 0, $this->imapParams);
-            $this->mboxFolder = "";
+        $this->mbox = @imap_open($this->server, $this->username, $this->password, OP_HALFOPEN, 0, $this->imapParams);
+        if (!$this->mbox) {
+            ZLog::Write(LOGLEVEL_WARN, "BackendIMAP->imap_reconnect(): could not (re)open IMAP connection: " . imap_last_error());
         }
+        $this->mboxFolder = "";
     }
 
     /**
